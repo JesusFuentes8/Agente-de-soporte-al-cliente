@@ -18,7 +18,7 @@ Actualiza Google Sheets: Guarda los resultados en las columnas correspondientes 
 
  ¿Cómo funciona el flujo?
 
-Cliente llena Formulario ──▶ Hoja de Google Sheets ──▶ Contenedor Docker (IA) ──▶ Actualiza con Resultados
+Cliente llena Formulario ── >Hoja de Google Sheets ──> Contenedor Docker (IA) ──> Actualiza con Resultados
 
 
  Manejo Seguro de Secretos
