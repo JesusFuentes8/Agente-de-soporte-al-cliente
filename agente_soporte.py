@@ -1,3 +1,4 @@
+import sys
 import json
 import os
 import time
@@ -5,14 +6,12 @@ import schedule
 import gspread
 from google import genai
 from google.genai import types
+from google.oauth2.credentials import Credentials
 
 # --- Configuración ---
 ARCHIVO_CREDENCIALES = "client_secrets.json"
 NOMBRE_HOJA = "Respuestas de Quejas (Base de Datos)"
-
-# PEGA AQUÍ TU API KEY ENTRE LAS COMILLAS:
-GEMINI_API_KEY = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
-INTERVALO_MINUTOS = 15
+INTERVALO_MINUTOS = 1  # 1 minuto según las instrucciones de Docker para modo continuo
 
 # Columnas en Google Sheets (base 1 para gspread)
 COL_CLASIFICACION = 4  # Columna D: Clasificación IA
@@ -23,17 +22,29 @@ cliente_gemini = None
 
 
 def conectar_sheets():
-    """Autentica con OAuth 2.0 y retorna la primera hoja del spreadsheet."""
-    try:
-        gc = gspread.oauth(
-            credentials_filename=ARCHIVO_CREDENCIALES,
-            authorized_user_filename="token.json"
-        )
-        spreadsheet = gc.open(NOMBRE_HOJA)
-        return spreadsheet.sheet1
-    except Exception as e:
-        print(f"[ERROR] Error al conectar con Google Sheets: {e}")
-        return None
+    """Autentica con GOOGLE_TOKEN_JSON de entorno si existe, o local con client_secrets.json."""
+    token_env = os.getenv("GOOGLE_TOKEN_JSON")
+    if token_env:
+        try:
+            info = json.loads(token_env)
+            creds = Credentials.from_authorized_user_info(info)
+            gc = gspread.authorize(creds)
+            spreadsheet = gc.open(NOMBRE_HOJA)
+            return spreadsheet.sheet1
+        except Exception as e:
+            print(f"[ERROR] Error al autenticar con GOOGLE_TOKEN_JSON: {e}")
+            return None
+    else:
+        try:
+            gc = gspread.oauth(
+                credentials_filename=ARCHIVO_CREDENCIALES,
+                authorized_user_filename="token.json"
+            )
+            spreadsheet = gc.open(NOMBRE_HOJA)
+            return spreadsheet.sheet1
+        except Exception as e:
+            print(f"[ERROR] Error al conectar con Google Sheets de forma local: {e}")
+            return None
 
 
 def analizar_con_gemini(comentario: str, max_reintentos: int = 3) -> dict:
@@ -55,7 +66,6 @@ def analizar_con_gemini(comentario: str, max_reintentos: int = 3) -> dict:
         temperature=0.1
     )
 
-    # Bucle con reintentos para manejar saturación de servidores (503 UNAVAILABLE)
     for intento in range(1, max_reintentos + 1):
         try:
             respuesta = cliente_gemini.models.generate_content(
@@ -64,7 +74,6 @@ def analizar_con_gemini(comentario: str, max_reintentos: int = 3) -> dict:
                 config=config
             )
 
-            # Limpieza de formato markdown si el modelo lo incluye
             texto = respuesta.text.strip()
             if texto.startswith("```"):
                 lineas = texto.splitlines()
@@ -93,11 +102,13 @@ def ejecutar_agente():
         print("No hay filas para procesar.")
         return
 
-    # Omitir fila 1 (encabezados). En Sheets los datos inician en fila 2
+    filas_pendientes = 0
+    filas_procesadas = 0
+
     for idx, fila in enumerate(filas[1:], start=2):
-        # Revisar si la columna F ya contiene "SI"
         agente_ejecutado = fila[COL_EJECUTADO - 1] if len(fila) >= COL_EJECUTADO else ""
         if agente_ejecutado.strip().upper() == "SI":
+            filas_procesadas += 1
             continue
 
         nombre_cliente = fila[1] if len(fila) > 1 and fila[1] else "Anónimo"
@@ -106,6 +117,7 @@ def ejecutar_agente():
         if not comentario.strip():
             continue
 
+        filas_pendientes += 1
         print(f"\nProcesando fila {idx} | Cliente: {nombre_cliente}")
         print(f"Comentario: {comentario}")
 
@@ -116,7 +128,6 @@ def ejecutar_agente():
 
             print(f"-> Clasificación: {clasificacion} | Sentimiento: {sentimiento}")
 
-            # Escribir en columnas D, E y F
             hoja.update_cell(idx, COL_CLASIFICACION, clasificacion)
             hoja.update_cell(idx, COL_SENTIMIENTO, sentimiento)
             hoja.update_cell(idx, COL_EJECUTADO, "SI")
@@ -127,31 +138,28 @@ def ejecutar_agente():
         except Exception as e:
             print(f"[ERROR] Error procesando fila {idx}: {e}")
 
-        # Pausa de 2 segundos entre filas para no saturar la API
         time.sleep(2)
+
+    print(f"\n[RESUMEN] Ya procesadas: {filas_procesadas} | Nuevas atendidas: {filas_pendientes}")
 
 
 if __name__ == "__main__":
-    if GEMINI_API_KEY == "TU_API_KEY_AQUI" or not GEMINI_API_KEY.strip():
-        print("[ERROR] Debes configurar una GEMINI_API_KEY válida en el script.")
-        exit(1)
+    api_key = os.getenv("GEMINI_API_KEY")
+    if not api_key:
+        print("[ERROR] Debes configurar la variable de entorno GEMINI_API_KEY.")
+        sys.exit(1)
 
-    if not os.path.exists(ARCHIVO_CREDENCIALES):
-        print(f"[ERROR] No se encontró '{ARCHIVO_CREDENCIALES}' en la carpeta actual.")
-        exit(1)
+    cliente_gemini = genai.Client(api_key=api_key)
 
-    # Inicializar cliente oficial de google-genai
-    cliente_gemini = genai.Client(api_key=GEMINI_API_KEY)
+    # Si se pasa el argumento --una-vez, ejecuta el ciclo y termina inmediatamente
+    if "--una-vez" in sys.argv:
+        ejecutar_agente()
+        sys.exit(0)
 
-    print(f"Iniciando agente. Revisión programada cada {INTERVALO_MINUTOS} minutos.")
-
-    # Primera ejecución inmediata
+    print(f"Iniciando agente en modo continuo. Revisión cada {INTERVALO_MINUTOS} minuto(s).")
     ejecutar_agente()
-
-    # Programar revisiones automáticas periódicas
     schedule.every(INTERVALO_MINUTOS).minutes.do(ejecutar_agente)
 
     while True:
         schedule.run_pending()
-        time.sleep(30)
-        #python agente_soporte.py
+        time.sleep(10)
